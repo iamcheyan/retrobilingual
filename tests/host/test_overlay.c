@@ -16,7 +16,10 @@ int rb_test_glyphs(void);
 int rb_test_slot(void);
 int rb_test_slot_has_data(int slot);
 int rb_test_hud_pos(void);
+int rb_test_hud_scroll(void);
+int rb_test_hud_first_visible_line(void);
 const char* rb_test_toast(void);
+int rb_test_slot_info(int slot, char* area_out, size_t area_sz, int* hearts_out, int* rupees_out);
 
 enum { RB_STATE_GAME = 0, RB_STATE_MENU = 1, RB_STATE_SUBTITLE = 2 };
 
@@ -83,7 +86,40 @@ int main(int argc, char** argv) {
     render[0x89] = 4;
     retrobilingual_process_input(&core, &keys, input_cb);
     assert(rb_test_dialogue_page() == 1);
-    assert(rb_test_glyphs() > 0);
+    assert(rb_test_glyphs() == 3); /* Exact (0201, 1), never page 0. */
+
+    /* A single pack page serves a later game page of the same dialogue. */
+    msg[8] = 0x02;
+    msg[9] = 0x02; /* text id 0x0202 */
+    render[0x89] = 3;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_dialogue_page() == 0);
+    assert(rb_test_glyphs() == 3);
+    render[0x89] = 4;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_dialogue_page() == 1);
+    assert(rb_test_glyphs() == 3); /* Page 0 is the only page. */
+
+    /* A multi-page dialogue with a missing middle page must not fall back. */
+    msg[8] = 0x03;
+    msg[9] = 0x02; /* text id 0x0203: pages 0 and 2 only */
+    render[0x89] = 3;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_dialogue_page() == 0);
+    assert(rb_test_glyphs() == 2);
+    render[0x89] = 4;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_dialogue_page() == 1);
+    assert(rb_test_glyphs() == 0); /* Render the FFFF missing-page notice. */
+
+    /* Return to the exact page-1 fixture for the existing overlay checks. */
+    msg[8] = 0x01;
+    msg[9] = 0x02;
+    render[0x89] = 3;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    render[0x89] = 4;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_glyphs() == 3);
 
     /* Default chord: L (bit 9) + Select (bit 2). */
     keys = (1u << 9) | (1u << 2);
@@ -107,6 +143,41 @@ int main(int argc, char** argv) {
     retrobilingual_process_input(&core, &keys, input_cb);
     assert(rb_test_state() == RB_STATE_GAME);
     assert(retrobilingual_should_run_frame(&core) == 1);
+
+    /* A long single pack page scrolls in the HUD without changing sDlgPage. */
+    msg[8] = 0x04;
+    msg[9] = 0x02; /* text id 0x0204 */
+    render[0x89] = 3;
+    keys = 0;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    x_down = 1;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_SUBTITLE);
+    x_down = 0;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    memset(fb, 0x11, sizeof(fb));
+    retrobilingual_draw(&core, fb, 240, 160, 240 * 2);
+    assert(rb_test_hud_scroll() == 0);
+    assert(rb_test_hud_first_visible_line() == 0);
+    keys = (1u << 4); /* RIGHT */
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_hud_scroll() == 2);
+    keys = 0;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    keys = (1u << 4); /* RIGHT */
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_hud_scroll() == 4);
+    assert(rb_test_dialogue_page() == 0);
+    memset(fb, 0x11, sizeof(fb));
+    retrobilingual_draw(&core, fb, 240, 160, 240 * 2);
+    assert(rb_test_hud_first_visible_line() == 4); /* Fifth and sixth lines. */
+    keys = 0;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    x_down = 1;
+    retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_GAME);
+    x_down = 0;
+    retrobilingual_process_input(&core, &keys, input_cb);
 
     /* Y opens the menu and pauses; Y closes it. */
     y_down = 1; keys = 0;
@@ -254,6 +325,51 @@ int main(int argc, char** argv) {
     keys = (1u << 0); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
     assert(rb_test_hud_pos() == 0); /* AUTO */
     /* Close menu */
+    y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_GAME);
+
+    /* Verify slot info queries: Slot 1 and 2 were saved during the test; Slot 4 is empty */
+    char area_buf[32];
+    int hearts = 0, rupees = 0;
+    assert(rb_test_slot_info(3, area_buf, sizeof(area_buf), &hearts, &rupees) == 0); /* Slot 4 empty */
+    assert(rb_test_slot_info(1, area_buf, sizeof(area_buf), &hearts, &rupees) == 1); /* Slot 2 valid (host stub small size) */
+
+    /* Create a full 0x61000 byte state for Slot 3 with mock EWRAM stats */
+    const char* dir = getenv("RETROBILINGUAL_DIR");
+    if (!dir) dir = "/tmp";
+    char slot3_path[512];
+    snprintf(slot3_path, sizeof(slot3_path), "%s/retrobilingual-slot3.state", dir);
+    FILE* f3 = fopen(slot3_path, "wb");
+    assert(f3 != NULL);
+    uint8_t* dummy_state = (uint8_t*)calloc(1, 0x61000);
+    assert(dummy_state != NULL);
+    dummy_state[0x23AEB] = 24 * 8; /* 24 hearts */
+    dummy_state[0x23B00] = 150 & 0xFF; /* 150 rupees */
+    dummy_state[0x23B01] = (150 >> 8) & 0xFF;
+    dummy_state[0x54A91] = 9; /* Location 9: NORTH HYRULE */
+    assert(fwrite(dummy_state, 1, 0x61000, f3) == 0x61000);
+    fclose(f3);
+    free(dummy_state);
+
+    memset(area_buf, 0, sizeof(area_buf));
+    assert(rb_test_slot_info(2, area_buf, sizeof(area_buf), &hearts, &rupees) == 1);
+    assert(strcmp(area_buf, "NORTH HYRULE") == 0);
+    assert(hearts == 24);
+    assert(rupees == 150);
+
+    /* Open menu, switch to Slot 3 and draw */
+    y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    keys = (1u << 7); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    /* Slot is currently 1 (Slot 2). Press RIGHT to go to Slot 3 (index 2) */
+    keys = (1u << 4); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_slot() == 2);
+    memset(fb, 0x11, sizeof(fb));
+    retrobilingual_draw(&core, fb, 240, 160, 240 * 2);
+    ink = 0;
+    for (int y = 0; y < 160; y++)
+        for (int x = 0; x < 240; x++)
+            if (fb[y * 240 + x] == 0xFFFF) ink++;
+    assert(ink > 50);
     y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
     assert(rb_test_state() == RB_STATE_GAME);
 

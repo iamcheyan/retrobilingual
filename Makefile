@@ -4,6 +4,7 @@ all: test
 
 test:
 	python3 tests/test_host.py
+	python3 tests/test_pack.py
 
 sync:
 	@if [ -d "../PJOS-LINUX" ]; then \
