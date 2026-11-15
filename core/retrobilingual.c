@@ -1,0 +1,955 @@
+/* RetroBilingual mGBA integration: in-frame menu, pause and subtitle overlay.
+ * SPDX-License-Identifier: MPL-2.0
+ *
+ * Frame path: this module is called from the libretro core before
+ * video_cb, so everything is composited into the GBA 240x160 framebuffer.
+ * No external window, no framebuffer race with the launcher.
+ *
+ * ROM gate: exact JP SHA-256 is carried by the translation pack; the core
+ * computes the ROM SHA-256 once and refuses the pack on mismatch.
+ *
+ * Keys (RetroPad ids):
+ *   X (9) short press       -> quick menu (never part of GBA keymap)
+ *   L (10) + Select (2)     -> toggle subtitle (default, configurable)
+ *   options: quick save/load and subtitle chord are configurable.
+ * Select+Start long press and L2/R2 are left to baseos-hotkeys.
+ */
+#ifdef RB_HOST_TEST
+#include "host_stubs.h"
+#define COLOR_16_BIT 1
+#else
+#include "retrobilingual.h"
+#include "libretro.h"
+
+#include <mgba/core/core.h>
+#include <mgba/gba/core.h>
+#include <mgba/internal/gba/gba.h>
+#include <mgba-util/vfs.h>
+#endif
+
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#define RB_JP_ROM_CRC32 0x6CE771A5u
+#define RB_JP_ROM_SIZE  0x01000000u
+#define RB_JP_ROM_SHA256 \
+    "16ac2572ba17e9cb2a70093d41f97ef8cff66c56417e45ea98adacdc51bb4b38"
+
+#define RB_EWRAM_MESSAGE      0x50u
+#define RB_EWRAM_TEXT_RENDER  0x22780u
+#define RB_MSG_STATE_ACTIVE   0x7Fu
+
+#define RB_KEY_A      (1u << 0)
+#define RB_KEY_B      (1u << 1)
+#define RB_KEY_SELECT (1u << 2)
+#define RB_KEY_START  (1u << 3)
+#define RB_KEY_RIGHT  (1u << 4)
+#define RB_KEY_LEFT   (1u << 5)
+#define RB_KEY_UP     (1u << 6)
+#define RB_KEY_DOWN   (1u << 7)
+#define RB_KEY_R      (1u << 8)
+#define RB_KEY_L      (1u << 9)
+
+#define RB_FB_W 240
+#define RB_FB_H 160
+#define RB_MAX_GLYPHS 8192
+#define RB_MAX_ENTRIES 16384
+#define RB_MAX_TEXT 512
+
+typedef enum { RB_GAME, RB_MENU, RB_SUBTITLE, RB_BINDINGS } RBState;
+typedef enum { ACT_SAVE, ACT_LOAD, ACT_SUBTITLE, ACT_COUNT } RBAction;
+typedef enum { X_ACT_SUBTITLE = 0, X_ACT_SAVE = 1, X_ACT_LOAD = 2, X_ACT_COUNT } XAction;
+
+typedef struct {
+    uint32_t codepoint;
+    uint16_t glyph_index;
+} RBGlyph;
+
+typedef struct {
+    uint16_t text_id;
+    uint8_t page;
+    uint32_t first_glyph;
+    uint16_t glyph_count;
+} RBEntry;
+
+static struct {
+    int loaded;
+    int glyph_w, glyph_h;
+    uint32_t glyph_count, entry_count;
+    RBGlyph glyphs[RB_MAX_GLYPHS];
+    uint8_t* bits;             /* glyph_count * glyph_bytes */
+    size_t glyph_bytes;
+    RBEntry entries[RB_MAX_ENTRIES];
+    uint16_t* indices;         /* sequences for all entries */
+    size_t index_count;
+    int16_t codepoint_map[0x10000];
+} sPack;
+
+static RBState sState;
+static int sInitialized;
+static int sMenuCursor;
+static int sBindingCursor;
+static int sBindingCapture;
+static int sBindingPending[2];
+static int sBindingCount;
+
+#define RB_SLOT_COUNT 5
+
+typedef enum {
+    RB_POS_AUTO = 0,
+    RB_POS_TOP = 1,
+    RB_POS_CENTER = 2,
+    RB_POS_BOTTOM = 3,
+    RB_POS_COUNT = 4
+} RBHudPos;
+
+typedef struct {
+    int enabled;
+    int x_action;              /* 0: SUBTITLE, 1: SAVE, 2: LOAD */
+    int slot;                  /* 0..4 (Slot 1..5) */
+    int hud_pos;               /* 0: AUTO, 1: TOP, 2: CENTER, 3: BOTTOM */
+    int chord[ACT_COUNT][2];   /* RetroPad ids, -1 = unset */
+} RBConfig;
+static RBConfig sCfg = {
+    .enabled = 1,
+    .x_action = X_ACT_SUBTITLE,
+    .slot = 0,
+    .hud_pos = RB_POS_AUTO,
+    .chord = {
+        { -1, -1 },            /* save */
+        { -1, -1 },            /* load */
+        { RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_SELECT },
+    },
+};
+
+static uint32_t sPrevKeys;
+static int sPrevX;
+static int sPrevY;
+static int sPrevAction[ACT_COUNT];
+
+static struct mCore* sCore;
+static void* sStateBuf;
+static size_t sStateSize;
+static char sConfigPath[512];
+static char sPackPath[512];
+static char sStatePath[512];
+
+static uint16_t sDlgTextId;
+static uint8_t sDlgPage;
+static uint8_t sDlgRender;
+static int sDlgActive;
+static int sDlgChanged;
+static uint32_t sDlgGlyphStart;
+static uint16_t sDlgGlyphCount;
+
+/* ---------- SHA-256 ---------------------------------------------------- */
+typedef struct { uint32_t h[8]; uint64_t len; uint8_t buf[64]; size_t fill; } Sha256;
+static const uint32_t SHA_K[64] = {
+    0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2,
+};
+#define RB_ROR(x,n) (((x)>>(n))|((x)<<(32-(n))))
+static void sha_block(Sha256* s, const uint8_t* p) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = (uint32_t)p[i*4]<<24 | (uint32_t)p[i*4+1]<<16 | (uint32_t)p[i*4+2]<<8 | p[i*4+3];
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = RB_ROR(w[i-15],7) ^ RB_ROR(w[i-15],18) ^ (w[i-15]>>3);
+        uint32_t s1 = RB_ROR(w[i-2],17) ^ RB_ROR(w[i-2],19) ^ (w[i-2]>>10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=s->h[0],b=s->h[1],c=s->h[2],d=s->h[3],e=s->h[4],f=s->h[5],g=s->h[6],h=s->h[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = RB_ROR(e,6) ^ RB_ROR(e,11) ^ RB_ROR(e,25);
+        uint32_t ch = (e & f) ^ (~e & g);
+        uint32_t t1 = h + S1 + ch + SHA_K[i] + w[i];
+        uint32_t S0 = RB_ROR(a,2) ^ RB_ROR(a,13) ^ RB_ROR(a,22);
+        uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+        uint32_t t2 = S0 + maj;
+        h=g; g=f; f=e; e=d+t1; d=c; c=b; b=a; a=t1+t2;
+    }
+    s->h[0]+=a; s->h[1]+=b; s->h[2]+=c; s->h[3]+=d;
+    s->h[4]+=e; s->h[5]+=f; s->h[6]+=g; s->h[7]+=h;
+}
+static void sha_init(Sha256* s) {
+    static const uint32_t iv[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+                                   0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
+    memcpy(s->h, iv, sizeof(iv)); s->len = 0; s->fill = 0;
+}
+static void sha_update(Sha256* s, const void* data, size_t n) {
+    const uint8_t* p = data;
+    s->len += n;
+    while (n--) {
+        s->buf[s->fill++] = *p++;
+        if (s->fill == 64) { sha_block(s, s->buf); s->fill = 0; }
+    }
+}
+static void sha_final(Sha256* s, uint8_t out[32]) {
+    uint64_t bits = s->len * 8;
+    uint8_t pad = 0x80;
+    sha_update(s, &pad, 1);
+    uint8_t zero = 0;
+    while (s->fill != 56) sha_update(s, &zero, 1);
+    uint8_t lenbe[8];
+    for (int i = 0; i < 8; i++) lenbe[i] = (uint8_t)(bits >> (56 - i*8));
+    sha_update(s, lenbe, 8);
+    for (int i = 0; i < 8; i++) {
+        out[i*4] = (uint8_t)(s->h[i]>>24); out[i*4+1] = (uint8_t)(s->h[i]>>16);
+        out[i*4+2] = (uint8_t)(s->h[i]>>8); out[i*4+3] = (uint8_t)s->h[i];
+    }
+}
+
+/* ---------- config and pack paths -------------------------------------- */
+static void rb_paths(void) {
+    const char* dir = getenv("RETROBILINGUAL_DIR");
+    if (!dir) dir = "/storage/.config/pocketjs";
+    snprintf(sConfigPath, sizeof(sConfigPath), "%s/retrobilingual.conf", dir);
+    snprintf(sPackPath, sizeof(sPackPath), "%s/retrobilingual.pack", dir);
+    snprintf(sStatePath, sizeof(sStatePath), "%s/retrobilingual-quick.state", dir);
+}
+
+static void rb_config_load(void) {
+    rb_paths();
+    FILE* f = fopen(sConfigPath, "r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        int a = -1, b = -1, v = -1;
+        if (sscanf(line, "x_action=%d", &v) == 1) {
+            if (v >= 0 && v < X_ACT_COUNT) sCfg.x_action = v;
+        }
+        else if (sscanf(line, "slot=%d", &v) == 1) {
+            if (v >= 0 && v < RB_SLOT_COUNT) sCfg.slot = v;
+        }
+        else if (sscanf(line, "hud_pos=%d", &v) == 1) {
+            if (v >= 0 && v < RB_POS_COUNT) sCfg.hud_pos = v;
+        }
+        else if (sscanf(line, "bind_save=%d,%d", &a, &b) == 2) { sCfg.chord[ACT_SAVE][0]=a; sCfg.chord[ACT_SAVE][1]=b; }
+        else if (sscanf(line, "bind_load=%d,%d", &a, &b) == 2) { sCfg.chord[ACT_LOAD][0]=a; sCfg.chord[ACT_LOAD][1]=b; }
+        else if (sscanf(line, "bind_subtitle=%d,%d", &a, &b) == 2) { sCfg.chord[ACT_SUBTITLE][0]=a; sCfg.chord[ACT_SUBTITLE][1]=b; }
+    }
+    fclose(f);
+}
+
+static void rb_config_save(void) {
+    rb_paths();
+    FILE* f = fopen(sConfigPath, "w");
+    if (!f) return;
+    fprintf(f, "subtitle_enabled=%d\n", sCfg.enabled ? 1 : 0);
+    fprintf(f, "x_action=%d\n", sCfg.x_action);
+    fprintf(f, "slot=%d\n", sCfg.slot);
+    fprintf(f, "hud_pos=%d\n", sCfg.hud_pos);
+    for (int i = 0; i < ACT_COUNT; i++) {
+        const char* key = i == ACT_SAVE ? "bind_save" : i == ACT_LOAD ? "bind_load" : "bind_subtitle";
+        fprintf(f, "%s=%d,%d\n", key, sCfg.chord[i][0], sCfg.chord[i][1]);
+    }
+    fclose(f);
+}
+
+/* ---------- translation pack ------------------------------------------ */
+static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0]|((uint32_t)p[1]<<8)|((uint32_t)p[2]<<16)|((uint32_t)p[3]<<24); }
+static uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0]|(p[1]<<8)); }
+
+static int rb_pack_load(void) {
+    if (sPack.loaded) return 1;
+    rb_paths();
+    FILE* f = fopen(sPackPath, "rb");
+    if (!f) return 0;
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size < 64 || size > 8 * 1024 * 1024) { fclose(f); return 0; }
+    uint8_t* data = malloc((size_t)size);
+    if (!data || fread(data, 1, (size_t)size, f) != (size_t)size) { free(data); fclose(f); return 0; }
+    fclose(f);
+
+    if (memcmp(data, "RBPK", 4) != 0) { free(data); return 0; }
+    int ok = 0;
+    do {
+        if (rd16(data + 4) != 1) break;
+        sPack.glyph_w = rd16(data + 6);
+        sPack.glyph_h = rd16(data + 8);
+        sPack.glyph_count = rd32(data + 10);
+        sPack.entry_count = rd32(data + 14);
+        if (sPack.glyph_w < 6 || sPack.glyph_w > 32 || sPack.glyph_h < 6 || sPack.glyph_h > 32) break;
+        if (sPack.glyph_count > RB_MAX_GLYPHS || sPack.entry_count > RB_MAX_ENTRIES) break;
+        size_t off = 18;
+        if (off + 32 > (size_t)size) break;
+        /* ROM hash gate */
+        Sha256 sha; sha_init(&sha);
+        const struct GBA* gba = sCore ? sCore->board : NULL;
+        if (!gba || gba->memory.romSize != RB_JP_ROM_SIZE) break;
+        sha_update(&sha, gba->memory.rom, gba->memory.romSize);
+        uint8_t digest[32]; sha_final(&sha, digest);
+        if (memcmp(digest, data + off, 32) != 0) break;
+        off += 32;
+
+        sPack.glyph_bytes = ((size_t)sPack.glyph_w * sPack.glyph_h + 7) / 8;
+        size_t glyph_table = (size_t)sPack.glyph_count * (4 + sPack.glyph_bytes);
+        size_t entry_table = (size_t)sPack.entry_count * 12;
+        if (off + glyph_table + entry_table > (size_t)size) break;
+
+        memset(sPack.codepoint_map, 0xFF, sizeof(sPack.codepoint_map));
+        sPack.bits = malloc((size_t)sPack.glyph_count * sPack.glyph_bytes);
+        if (!sPack.bits) break;
+        for (uint32_t i = 0; i < sPack.glyph_count; i++) {
+            uint32_t cp = rd32(data + off);
+            off += 4;
+            if (cp < 0x10000) sPack.codepoint_map[cp] = (int16_t)i;
+            memcpy(sPack.bits + (size_t)i * sPack.glyph_bytes, data + off, sPack.glyph_bytes);
+            off += sPack.glyph_bytes;
+        }
+        for (uint32_t i = 0; i < sPack.entry_count; i++) {
+            sPack.entries[i].text_id = rd16(data + off);
+            sPack.entries[i].page = data[off + 2];
+            sPack.entries[i].first_glyph = rd32(data + off + 4);
+            sPack.entries[i].glyph_count = (uint16_t)rd32(data + off + 8);
+            off += 12;
+        }
+        /* Remaining bytes: glyph index sequences. */
+        size_t index_bytes = (size_t)size - off;
+        sPack.index_count = index_bytes / 2;
+        sPack.indices = malloc(index_bytes);
+        if (!sPack.indices) break;
+        memcpy(sPack.indices, data + off, index_bytes);
+        for (uint32_t i = 0; i < sPack.entry_count; i++) {
+            RBEntry* e = &sPack.entries[i];
+            if ((size_t)e->first_glyph + e->glyph_count > sPack.index_count) { ok = -1; break; }
+        }
+        if (ok < 0) break;
+        ok = 1;
+        sPack.loaded = 1;
+    } while (0);
+    free(data);
+    return ok == 1;
+}
+
+static int rb_find_entry(uint16_t text_id, uint8_t page, RBEntry** out) {
+    for (uint32_t i = 0; i < sPack.entry_count; i++) {
+        RBEntry* e = &sPack.entries[i];
+        if (e->text_id == text_id && e->page == page) { *out = e; return 1; }
+    }
+    return 0;
+}
+
+static int rb_find_dialogue_entry(uint16_t text_id, uint8_t page, RBEntry** out) {
+    if (rb_find_entry(text_id, page, out)) return 1;
+    for (int p = (int)page - 1; p >= 0; p--) {
+        if (rb_find_entry(text_id, (uint8_t)p, out)) return 1;
+    }
+    return 0;
+}
+
+/* ---------- dialogue state --------------------------------------------- */
+static void rb_dialogue_read(const struct GBA* gba) {
+    if (!sPack.loaded || !gba || !gba->memory.wram) {
+        if (sDlgActive) sDlgChanged = 1;
+        sDlgActive = 0;
+        sDlgGlyphCount = 0;
+        return;
+    }
+    const uint8_t* ewram = (const uint8_t*)gba->memory.wram;
+    uint8_t  state   = ewram[RB_EWRAM_MESSAGE];
+    uint16_t textId  = rd16(ewram + RB_EWRAM_MESSAGE + 8);
+    uint8_t  render  = ewram[RB_EWRAM_TEXT_RENDER + 0x89];
+    int active = (state & RB_MSG_STATE_ACTIVE) != 0;
+
+    if (!active) {
+        if (sDlgActive) sDlgChanged = 1;
+        sDlgActive = 0;
+        return;
+    }
+    if (!sDlgActive || textId != sDlgTextId) {
+        sDlgTextId = textId;
+        sDlgPage = 0;
+        sDlgChanged = 1;
+    } else if (sDlgRender == 3 && render == 4) {
+        if (sDlgPage < 0xFF) sDlgPage++;
+        sDlgChanged = 1;
+    }
+    sDlgRender = render;
+    sDlgActive = 1;
+
+    RBEntry* e = NULL;
+    if (sPack.loaded && rb_find_dialogue_entry(sDlgTextId, sDlgPage, &e)) {
+        sDlgGlyphStart = e->first_glyph;
+        sDlgGlyphCount = e->glyph_count;
+    } else {
+        sDlgGlyphStart = 0;
+        sDlgGlyphCount = 0;
+    }
+}
+
+/* ---------- drawing ---------------------------------------------------- */
+#ifdef COLOR_16_BIT
+typedef uint16_t pixel_t;
+#define PITCH_PIXELS(p) ((p) / 2u)
+static inline uint16_t shade(uint16_t c) { return (uint16_t)((c >> 1) & 0x3DEF); }
+#else
+typedef uint32_t pixel_t;
+#define PITCH_PIXELS(p) ((p) / 4u)
+static inline uint32_t shade(uint32_t c) { return (c >> 1) & 0xFEFEFEFEu; }
+#endif
+
+static void rect(pixel_t* fb, unsigned p, int x, int y, int w, int h, pixel_t c) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > RB_FB_W) w = RB_FB_W - x;
+    if (y + h > RB_FB_H) h = RB_FB_H - y;
+    for (int r = 0; r < h; r++)
+        for (int c2 = 0; c2 < w; c2++)
+            fb[(y + r) * p + x + c2] = c;
+}
+
+static void glyph_color(pixel_t* fb, unsigned p, int x, int y, uint16_t index, pixel_t c) {
+    if (!sPack.loaded || index >= sPack.glyph_count) return;
+    int gw = sPack.glyph_w, gh = sPack.glyph_h;
+    const uint8_t* bmp = sPack.bits + (size_t)index * sPack.glyph_bytes;
+    for (int gy = 0; gy < gh; gy++) {
+        int dy = y + gy;
+        if (dy < 0 || dy >= RB_FB_H) continue;
+        for (int gx = 0; gx < gw; gx++) {
+            int bit = gy * gw + gx;
+            if (!(bmp[bit >> 3] & (0x80 >> (bit & 7)))) continue;
+            int dx = x + gx;
+            if (dx >= 0 && dx < RB_FB_W) fb[dy * p + dx] = c;
+        }
+    }
+}
+
+
+static const char* action_name(int a) {
+    return a == ACT_SAVE ? "SAVE" : a == ACT_LOAD ? "LOAD" : "SUBTITLE";
+}
+
+/* Minimal UI font: draw a 5x7 ASCII glyph from a compact table. */
+static const uint8_t UI_FONT[96][5] = {
+    {0,0,0,0,0},{0,0,0x5F,0,0},{0,7,0,7,0},{0x14,0x7F,0x14,0x7F,0x14},
+    {0x24,0x2A,0x7F,0x2A,0x12},{0x23,0x13,0x08,0x64,0x62},{0x36,0x49,0x55,0x22,0x50},
+    {0,5,3,0,0},{0,0x1C,0x22,0x41,0},{0,0x41,0x22,0x1C,0},{0x14,0x08,0x3E,0x08,0x14},
+    {0x08,0x08,0x3E,0x08,0x08},{0,0x50,0x30,0,0},{0x08,0x08,0x08,0x08,0x08},
+    {0,0x60,0x60,0,0},{0x20,0x10,0x08,0x04,0x02},{0x3E,0x51,0x49,0x45,0x3E},
+    {0,0x42,0x7F,0x40,0},{0x42,0x61,0x51,0x49,0x46},{0x21,0x41,0x45,0x4B,0x31},
+    {0x18,0x14,0x12,0x7F,0x10},{0x27,0x45,0x45,0x45,0x39},{0x3C,0x4A,0x49,0x49,0x30},
+    {0x01,0x71,0x09,0x05,0x03},{0x36,0x49,0x49,0x49,0x36},{0x06,0x49,0x49,0x29,0x1E},
+    {0,0x36,0x36,0,0},{0,0x56,0x36,0,0},{0x08,0x14,0x22,0x41,0},
+    {0x14,0x14,0x14,0x14,0x14},{0,0x41,0x22,0x14,0x08},{0x02,0x01,0x51,0x09,0x06},
+    {0x32,0x49,0x79,0x41,0x3E},{0x7E,0x11,0x11,0x11,0x7E},{0x7F,0x49,0x49,0x49,0x36},
+    {0x3E,0x41,0x41,0x41,0x22},{0x7F,0x41,0x41,0x22,0x1C},{0x7F,0x49,0x49,0x49,0x41},
+    {0x7F,0x09,0x09,0x01,0x01},{0x3E,0x41,0x49,0x49,0x7A},{0x7F,0x08,0x08,0x08,0x7F},
+    {0,0x41,0x7F,0x41,0},{0x20,0x40,0x41,0x3F,0x01},{0x7F,0x08,0x14,0x22,0x41},
+    {0x7F,0x40,0x40,0x40,0x40},{0x7F,0x02,0x04,0x02,0x7F},{0x7F,0x04,0x08,0x10,0x7F},
+    {0x3E,0x41,0x41,0x41,0x3E},{0x7F,0x09,0x09,0x09,0x06},{0x3E,0x41,0x51,0x21,0x5E},
+    {0x7F,0x09,0x19,0x29,0x46},{0x46,0x49,0x49,0x49,0x31},{0x01,0x01,0x7F,0x01,0x01},
+    {0x3F,0x40,0x40,0x40,0x3F},{0x1F,0x20,0x40,0x20,0x1F},{0x3F,0x40,0x38,0x40,0x3F},
+    {0x63,0x14,0x08,0x14,0x63},{0x07,0x08,0x70,0x08,0x07},{0x61,0x51,0x49,0x45,0x43},
+};
+static void ui_text(pixel_t* fb, unsigned p, int x, int y, const char* s, pixel_t c) {
+    int cx = x;
+    for (; *s; s++) {
+        unsigned ch = (unsigned char)*s;
+        if (ch < 32 || ch > 127) { cx += 6; continue; }
+        const uint8_t* g = UI_FONT[ch - 32];
+        for (int col = 0; col < 5; col++)
+            for (int row = 0; row < 7; row++)
+                if (g[col] & (1u << row)) {
+                    int dx = cx + col, dy = y + row;
+                    if (dx >= 0 && dx < RB_FB_W && dy >= 0 && dy < RB_FB_H) fb[dy * p + dx] = c;
+                }
+        cx += 6;
+    }
+}
+
+/* ---------- persistence actions ---------------------------------------- */
+static char sToastMsg[64];
+static int sToastTicks;
+
+static void set_toast(const char* msg) {
+    snprintf(sToastMsg, sizeof(sToastMsg), "%s", msg);
+    sToastTicks = 120;
+}
+
+static void rb_state_path(int slot, char* out, size_t out_sz) {
+    const char* dir = getenv("RETROBILINGUAL_DIR");
+    if (!dir) dir = "/storage/.config/pocketjs";
+    snprintf(out, out_sz, "%s/retrobilingual-slot%d.state", dir, slot + 1);
+}
+
+static int rb_slot_has_data(int slot) {
+    char path[512];
+    rb_state_path(slot, path, sizeof(path));
+    if (access(path, R_OK) == 0) return 1;
+    if (slot == 0) {
+        const char* dir = getenv("RETROBILINGUAL_DIR");
+        if (!dir) dir = "/storage/.config/pocketjs";
+        snprintf(path, sizeof(path), "%s/retrobilingual-quick.state", dir);
+        if (access(path, R_OK) == 0) return 1;
+    }
+    return 0;
+}
+
+static int rb_slot_save(struct mCore* core, int slot) {
+    if (!core || !core->stateSize || !core->saveState) return 0;
+    size_t size = core->stateSize(core);
+    if (!size) return 0;
+    void* buf = malloc(size);
+    if (!buf) return 0;
+    if (!core->saveState(core, buf)) {
+        free(buf);
+        return 0;
+    }
+    char path[512];
+    rb_state_path(slot, path, sizeof(path));
+    FILE* f = fopen(path, "wb");
+    if (!f) {
+        free(buf);
+        return 0;
+    }
+    size_t written = fwrite(buf, 1, size, f);
+    fclose(f);
+    free(buf);
+    return written == size;
+}
+
+static int rb_slot_load(struct mCore* core, int slot) {
+    if (!core || !core->stateSize || !core->loadState) return 0;
+    char path[512];
+    rb_state_path(slot, path, sizeof(path));
+    FILE* f = fopen(path, "rb");
+    if (!f) {
+        if (slot == 0) {
+            const char* dir = getenv("RETROBILINGUAL_DIR");
+            if (!dir) dir = "/storage/.config/pocketjs";
+            snprintf(path, sizeof(path), "%s/retrobilingual-quick.state", dir);
+            f = fopen(path, "rb");
+        }
+        if (!f) return -1;
+    }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    size_t expected = core->stateSize(core);
+    if (sz <= 0 || (size_t)sz != expected) {
+        fclose(f);
+        return 0;
+    }
+    void* buf = malloc(expected);
+    if (!buf) {
+        fclose(f);
+        return 0;
+    }
+    if (fread(buf, 1, expected, f) != expected) {
+        free(buf);
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    int ok = core->loadState(core, buf);
+    if (ok) {
+        if (sStateSize != expected) {
+            free(sStateBuf);
+            sStateBuf = malloc(expected);
+            sStateSize = expected;
+        }
+        if (sStateBuf) memcpy(sStateBuf, buf, expected);
+    }
+    free(buf);
+    return ok ? 1 : 0;
+}
+
+static void do_save(struct mCore* core) {
+    int ok = rb_slot_save(core, sCfg.slot);
+    char buf[48];
+    if (ok) snprintf(buf, sizeof(buf), "SAVED TO SLOT %d", sCfg.slot + 1);
+    else snprintf(buf, sizeof(buf), "SAVE FAILED!");
+    set_toast(buf);
+}
+
+static void do_load(struct mCore* core) {
+    int res = rb_slot_load(core, sCfg.slot);
+    char buf[48];
+    if (res == 1) snprintf(buf, sizeof(buf), "LOADED SLOT %d", sCfg.slot + 1);
+    else if (res == -1) snprintf(buf, sizeof(buf), "SLOT %d IS EMPTY", sCfg.slot + 1);
+    else snprintf(buf, sizeof(buf), "LOAD FAILED!");
+    set_toast(buf);
+}
+
+static void rb_pause(struct mCore* core) {
+    size_t need = core->stateSize(core);
+    if (need != sStateSize) {
+        free(sStateBuf);
+        sStateBuf = malloc(need);
+        sStateSize = need;
+    }
+    if (sStateBuf) core->saveState(core, sStateBuf);
+}
+static void rb_resume(struct mCore* core) {
+    if (sStateBuf) core->loadState(core, sStateBuf);
+}
+
+/* ---------- input ------------------------------------------------------ */
+static int edge(uint32_t now, uint32_t prev, uint32_t bit) {
+    return (now & bit) && !(prev & bit);
+}
+
+static int chord_down(uint16_t keys, const int* chord) {
+    int a = chord[0], b = chord[1];
+    uint32_t mask = 0;
+    if (a >= 0 && a < 10) mask |= 1u << a;
+    if (b >= 0 && b < 10) mask |= 1u << b;
+    if (!mask) return 0;
+    return (keys & mask) == mask;
+}
+
+void retrobilingual_process_input(struct mCore* core, uint16_t* keys,
+                                  retro_input_state_t input)
+{
+    if (!core) return;
+    const struct GBA* gba = core->board;
+    if (!gba) return;
+    int first = !sInitialized;
+    sInitialized = 1;
+    if (first) {
+        sCore = core;
+        rb_paths();
+        rb_config_load();
+        rb_pack_load();
+    }
+
+    int y_pressed = input && input(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y);
+    int y_just = y_pressed && !sPrevY;
+    int x_pressed = input && input(0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X);
+    int x_just = x_pressed && !sPrevX;
+    uint16_t prev = (uint16_t)sPrevKeys;
+    uint32_t now = *keys;
+
+    if (sState == RB_BINDINGS) {
+        static const int ids[] = {
+            RETRO_DEVICE_ID_JOYPAD_A, RETRO_DEVICE_ID_JOYPAD_B,
+            RETRO_DEVICE_ID_JOYPAD_L, RETRO_DEVICE_ID_JOYPAD_R,
+            RETRO_DEVICE_ID_JOYPAD_SELECT, RETRO_DEVICE_ID_JOYPAD_START,
+            RETRO_DEVICE_ID_JOYPAD_UP, RETRO_DEVICE_ID_JOYPAD_DOWN,
+            RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT,
+        };
+        if (y_just || x_just || edge(now, prev, RB_KEY_B)) { sState = RB_MENU; *keys = 0; goto done; }
+        if (!sBindingCapture) {
+            if (edge(now, prev, RB_KEY_DOWN)) sBindingCursor = (sBindingCursor + 1) % ACT_COUNT;
+            if (edge(now, prev, RB_KEY_UP)) sBindingCursor = (sBindingCursor + ACT_COUNT - 1) % ACT_COUNT;
+            if (edge(now, prev, RB_KEY_A)) { sBindingCapture = 1; sBindingCount = 0; }
+        } else {
+            int any = 0;
+            for (size_t i = 0; i < sizeof(ids)/sizeof(ids[0]); i++) {
+                int down = input && input(0, RETRO_DEVICE_JOYPAD, 0, ids[i]);
+                if (down) {
+                    any = 1;
+                    if (sBindingCount < 2 &&
+                        (sBindingCount == 0 || sBindingPending[sBindingCount - 1] != ids[i])) {
+                        sBindingPending[sBindingCount++] = ids[i];
+                    }
+                }
+            }
+            if (!any && sBindingCount > 0) {
+                sCfg.chord[sBindingCursor][0] = sBindingPending[0];
+                sCfg.chord[sBindingCursor][1] = sBindingCount > 1 ? sBindingPending[1] : -1;
+                rb_config_save();
+                sBindingCapture = 0;
+            }
+        }
+        *keys = 0;
+        goto done;
+    }
+
+    if (sState == RB_MENU) {
+        if (edge(now, prev, RB_KEY_DOWN)) sMenuCursor = (sMenuCursor + 1) % 5;
+        if (edge(now, prev, RB_KEY_UP)) sMenuCursor = (sMenuCursor + 4) % 5;
+        if (sMenuCursor == 1 || sMenuCursor == 2) {
+            if (edge(now, prev, RB_KEY_RIGHT)) { sCfg.slot = (sCfg.slot + 1) % RB_SLOT_COUNT; rb_config_save(); }
+            if (edge(now, prev, RB_KEY_LEFT)) { sCfg.slot = (sCfg.slot + RB_SLOT_COUNT - 1) % RB_SLOT_COUNT; rb_config_save(); }
+        } else if (sMenuCursor == 3) {
+            if (edge(now, prev, RB_KEY_RIGHT)) { sCfg.x_action = (sCfg.x_action + 1) % X_ACT_COUNT; rb_config_save(); }
+            if (edge(now, prev, RB_KEY_LEFT)) { sCfg.x_action = (sCfg.x_action + X_ACT_COUNT - 1) % X_ACT_COUNT; rb_config_save(); }
+        } else if (sMenuCursor == 4) {
+            if (edge(now, prev, RB_KEY_RIGHT)) { sCfg.hud_pos = (sCfg.hud_pos + 1) % RB_POS_COUNT; rb_config_save(); }
+            if (edge(now, prev, RB_KEY_LEFT)) { sCfg.hud_pos = (sCfg.hud_pos + RB_POS_COUNT - 1) % RB_POS_COUNT; rb_config_save(); }
+        }
+
+        if (y_just || edge(now, prev, RB_KEY_B)) {
+            rb_resume(core);
+            sState = RB_GAME;
+        } else if (edge(now, prev, RB_KEY_A)) {
+            switch (sMenuCursor) {
+            case 0: rb_resume(core); sState = RB_GAME; break;
+            case 1: do_save(core); rb_resume(core); sState = RB_GAME; break;
+            case 2: do_load(core); sState = RB_GAME; break;
+            case 3: sCfg.x_action = (sCfg.x_action + 1) % X_ACT_COUNT; rb_config_save(); break;
+            case 4: sCfg.hud_pos = (sCfg.hud_pos + 1) % RB_POS_COUNT; rb_config_save(); break;
+            default: break;
+            }
+        }
+        *keys = 0;
+        goto done;
+    }
+
+    if (sState == RB_SUBTITLE) {
+        if (x_just || y_just || edge(now, prev, RB_KEY_B) || chord_down((uint16_t)now, sCfg.chord[ACT_SUBTITLE])) {
+            rb_resume(core);
+            sState = RB_GAME;
+        }
+        *keys = 0;
+        goto done;
+    }
+
+    /* RB_GAME */
+    if (y_just) {
+        rb_pause(core);
+        sState = RB_MENU;
+        sMenuCursor = 0;
+    } else if (x_just) {
+        if (sCfg.x_action == X_ACT_SUBTITLE) {
+            rb_dialogue_read(gba);
+            rb_pause(core);
+            sState = RB_SUBTITLE;
+        } else if (sCfg.x_action == X_ACT_SAVE) {
+            do_save(core);
+        } else if (sCfg.x_action == X_ACT_LOAD) {
+            do_load(core);
+        }
+    } else {
+        for (int a = 0; a < ACT_COUNT; a++) {
+            int c = chord_down((uint16_t)now, sCfg.chord[a]);
+            if (c && !sPrevAction[a]) {
+                if (a == ACT_SAVE) do_save(core);
+                else if (a == ACT_LOAD) do_load(core);
+                else if (a == ACT_SUBTITLE) {
+                    rb_dialogue_read(gba);
+                    rb_pause(core);
+                    sState = RB_SUBTITLE;
+                }
+            }
+            sPrevAction[a] = c;
+        }
+    }
+
+    if (sState != RB_GAME) *keys = 0;
+    else rb_dialogue_read(gba);
+
+done:
+    sPrevKeys = now;
+    sPrevX = x_pressed;
+    sPrevY = y_pressed;
+}
+
+int retrobilingual_should_run_frame(struct mCore* core) {
+    (void)core;
+    return sState == RB_GAME;
+}
+
+void retrobilingual_draw(struct mCore* core, void* pixels, unsigned width,
+                         unsigned height, unsigned pitch)
+{
+    if (!sInitialized || width != RB_FB_W || height != RB_FB_H) return;
+    pixel_t* fb = (pixel_t*)pixels;
+    unsigned p = PITCH_PIXELS(pitch);
+
+    if (sState == RB_SUBTITLE) {
+        /* Clean non-intrusive floating HUD: no full screen shading, no modal frame, no title/footer */
+        uint32_t start = sDlgGlyphStart;
+        uint16_t total_glyphs = sDlgGlyphCount;
+        int is_notice = 0;
+        if (!total_glyphs) {
+            RBEntry* notice = NULL;
+            if (rb_find_entry(0xFFFF, 0, &notice)) {
+                start = notice->first_glyph;
+                total_glyphs = notice->glyph_count;
+                is_notice = 1;
+            }
+        }
+
+        if (total_glyphs && sPack.loaded) {
+            int line_starts[8];
+            int line_counts[8];
+            int line_n = 0;
+            int max_w = 0;
+            int cur_start = 0;
+            int cur_count = 0;
+
+            for (uint16_t i = 0; i < total_glyphs; i++) {
+                uint16_t idx = sPack.indices[start + i];
+                if (idx == 0xFFFF) {
+                    if (line_n < 8) {
+                        line_starts[line_n] = cur_start;
+                        line_counts[line_n] = cur_count;
+                        int lw = cur_count * sPack.glyph_w;
+                        if (lw > max_w) max_w = lw;
+                        line_n++;
+                    }
+                    cur_start = i + 1;
+                    cur_count = 0;
+                } else {
+                    cur_count++;
+                }
+            }
+            if (line_n < 8 && cur_count > 0) {
+                line_starts[line_n] = cur_start;
+                line_counts[line_n] = cur_count;
+                int lw = cur_count * sPack.glyph_w;
+                if (lw > max_w) max_w = lw;
+                line_n++;
+            }
+            if (line_n == 0) line_n = 1;
+
+            int line_h = sPack.glyph_h + 3;
+            int total_h = line_n * line_h - 3;
+            if (total_h < 12) total_h = 12;
+
+            /* Determine whether dialogue box is at bottom, top, or center */
+            int target_y;
+            if (sCfg.hud_pos == RB_POS_BOTTOM) {
+                target_y = 106 + (38 - total_h) / 2;
+            } else if (sCfg.hud_pos == RB_POS_TOP) {
+                target_y = 14 + (38 - total_h) / 2;
+            } else if (sCfg.hud_pos == RB_POS_CENTER) {
+                target_y = (RB_FB_H - total_h) / 2;
+            } else {
+                /* RB_POS_AUTO: Auto-detect whether in-game dialogue box is at bottom or top */
+                int at_bottom = 0;
+                if ((fb[108 * p + 120] & 0x7BEF) == 0 && (fb[14 * p + 120] & 0x7BEF) != 0) {
+                    at_bottom = 1;
+                }
+                target_y = at_bottom ? (106 + (38 - total_h) / 2) : (14 + (38 - total_h) / 2);
+            }
+            if (target_y < 8) target_y = 8;
+            if (target_y + total_h > RB_FB_H - 8) target_y = RB_FB_H - 8 - total_h;
+
+            int pill_pad_x = 8;
+            int pill_pad_y = 4;
+            int pill_x = (RB_FB_W - max_w) / 2 - pill_pad_x;
+            int pill_y = target_y - pill_pad_y;
+            int pill_w = max_w + pill_pad_x * 2;
+            int pill_h = total_h + pill_pad_y * 2;
+            if (pill_x < 4) { pill_x = 4; pill_w = RB_FB_W - 8; }
+
+            /* Subtle dark slate backing pill covering dialogue area cleanly */
+            for (int r = pill_y; r < pill_y + pill_h; r++) {
+                if (r < 0 || r >= RB_FB_H) continue;
+                for (int c = pill_x; c < pill_x + pill_w; c++) {
+                    if (c < 0 || c >= RB_FB_W) continue;
+                    if ((r == pill_y || r == pill_y + pill_h - 1) &&
+                        (c == pill_x || c == pill_x + pill_w - 1)) continue;
+                    fb[r * p + c] = 0x0842;
+                }
+            }
+            /* Clean subtle border */
+            for (int c = pill_x + 1; c < pill_x + pill_w - 1; c++) {
+                if (pill_y >= 0 && pill_y < RB_FB_H && c >= 0 && c < RB_FB_W)
+                    fb[pill_y * p + c] = 0x2128;
+                if (pill_y + pill_h - 1 >= 0 && pill_y + pill_h - 1 < RB_FB_H && c >= 0 && c < RB_FB_W)
+                    fb[(pill_y + pill_h - 1) * p + c] = 0x2128;
+            }
+            for (int r = pill_y + 1; r < pill_y + pill_h - 1; r++) {
+                if (r >= 0 && r < RB_FB_H && pill_x >= 0 && pill_x < RB_FB_W)
+                    fb[r * p + pill_x] = 0x2128;
+                if (r >= 0 && r < RB_FB_H && pill_x + pill_w - 1 >= 0 && pill_x + pill_w - 1 < RB_FB_W)
+                    fb[r * p + pill_x + pill_w - 1] = 0x2128;
+            }
+
+            /* Draw centered lines with drop shadow and crisp text */
+            for (int l = 0; l < line_n; l++) {
+                int lw = line_counts[l] * sPack.glyph_w;
+                int lx = (RB_FB_W - lw) / 2;
+                int ly = target_y + l * line_h;
+                for (int g = 0; g < line_counts[l]; g++) {
+                    uint16_t idx = sPack.indices[start + line_starts[l] + g];
+                    int gx = lx + g * sPack.glyph_w;
+                    glyph_color(fb, p, gx + 1, ly + 1, idx, 0x0000);
+                    glyph_color(fb, p, gx, ly, idx, is_notice ? 0xCE79 : 0xFFFF);
+                }
+            }
+        } else {
+            int nw = 14 * 6;
+            int nx = (RB_FB_W - nw) / 2;
+            int ny = 24;
+            rect(fb, p, nx - 4, ny - 3, nw + 8, 14, 0x0842);
+            ui_text(fb, p, nx, ny, "NO TRANSLATION", 0xFFFF);
+        }
+    } else if (sState == RB_MENU || sState == RB_BINDINGS) {
+        int mw = 180, mh = 5 * 16 + 16;
+        int mx = (RB_FB_W - mw) / 2, my = 18;
+        rect(fb, p, mx - 2, my - 2, mw + 4, mh + 4, 0x7BEF);
+        rect(fb, p, mx, my, mw, mh, 0x0000);
+        if (sState == RB_MENU) {
+            static const char* labels[5] = {
+                "RESUME", "QUICK SAVE", "QUICK LOAD", "X BUTTON", "POSITION"
+            };
+            static const char* x_names[X_ACT_COUNT] = {
+                "TRANSLATE", "SAVE", "LOAD"
+            };
+            static const char* pos_names[RB_POS_COUNT] = {
+                "AUTO", "TOP", "CENTER", "BOTTOM"
+            };
+            for (int i = 0; i < 5; i++) {
+                int iy = my + 8 + i * 16;
+                if (i == sMenuCursor) rect(fb, p, mx + 2, iy - 2, mw - 4, 12, 0x2965);
+                ui_text(fb, p, mx + 8, iy, labels[i], 0xFFFF);
+                if (i == 1 || i == 2) {
+                    char buf[24];
+                    int has_data = rb_slot_has_data(sCfg.slot);
+                    uint16_t slot_col = has_data ? 0x2FE5 : 0x7BEF; /* Green if has data, Gray if empty */
+                    snprintf(buf, sizeof(buf), "< SLOT %d >", sCfg.slot + 1);
+                    ui_text(fb, p, mx + mw - 62, iy, buf, slot_col);
+                } else if (i == 3) {
+                    ui_text(fb, p, mx + mw - 62, iy, x_names[sCfg.x_action], 0xFFE0);
+                } else if (i == 4) {
+                    ui_text(fb, p, mx + mw - 48, iy, pos_names[sCfg.hud_pos], 0xFFE0);
+                }
+            }
+        } else {
+            ui_text(fb, p, mx + 8, my + 8, "BIND ACTION (A=CAPTURE)", 0xFFFF);
+            for (int a = 0; a < ACT_COUNT; a++) {
+                int iy = my + 26 + a * 20;
+                if (a == sBindingCursor) rect(fb, p, mx + 2, iy - 2, mw - 4, 12, 0x2965);
+                ui_text(fb, p, mx + 8, iy, action_name(a), 0xFFFF);
+                char buf[24];
+                if (sBindingCapture && a == sBindingCursor) snprintf(buf, sizeof(buf), "PRESS...");
+                else snprintf(buf, sizeof(buf), "%d,%d", sCfg.chord[a][0], sCfg.chord[a][1]);
+                ui_text(fb, p, mx + 100, iy, buf, 0xAD55);
+            }
+        }
+        ui_text(fb, p, 4, RB_FB_H - 10, "Y/B:CLOSE  A:OK  < >:SLOT/OPTION", 0xAD55);
+    }
+
+    if (sToastTicks > 0) {
+        int tw = (int)strlen(sToastMsg) * 6 + 12;
+        int tx = (RB_FB_W - tw) / 2;
+        int ty = 8;
+        rect(fb, p, tx - 1, ty - 1, tw + 2, 14, 0x7BEF);
+        for (int r = ty; r < ty + 12; r++)
+            for (int c = tx; c < tx + tw; c++)
+                fb[r * p + c] = 0x1084;
+        ui_text(fb, p, tx + 6, ty + 2, sToastMsg, 0xFFFF);
+        if (sState == RB_GAME) sToastTicks--;
+    }
+    (void)core;
+}
+
+#ifdef RB_HOST_TEST
+int rb_test_pack_loaded(void) { return sPack.loaded; }
+int rb_test_state(void) { return (int)sState; }
+int rb_test_dialogue_page(void) { return (int)sDlgPage; }
+int rb_test_glyphs(void) { return (int)sDlgGlyphCount; }
+int rb_test_slot(void) { return sCfg.slot; }
+int rb_test_slot_has_data(int slot) { return rb_slot_has_data(slot); }
+int rb_test_hud_pos(void) { return sCfg.hud_pos; }
+const char* rb_test_toast(void) { return sToastTicks > 0 ? sToastMsg : ""; }
+#endif
