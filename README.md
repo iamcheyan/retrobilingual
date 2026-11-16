@@ -107,6 +107,7 @@ python3 patches/apply-mgba.py /path/to/mgba /path/to/retrobilingual/core
 - [Architecture & Mechanics (架构原理解析)](docs/ARCHITECTURE.md)
 - [How to Adapt Any Retro Game (如何为任意复古游戏制作双语适配)](docs/HOW_TO_ADAPT_GAMES.md)
 - [Handheld Hardware Mapping & DTS Pitfalls (掌机按键驱动与硬件映射排错指南)](docs/HARDWARE_MAPPING.md)
+- [Issue #160 Game Adaptation Research (游戏适配前期资料)](docs/GAME_RESEARCH_ISSUE_160.md)
 
 ---
 
