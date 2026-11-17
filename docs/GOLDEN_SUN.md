@@ -80,6 +80,22 @@ This is a quality risk, not a coverage gap; the source text of every record
 was independently matched against the Japanese strings decoded from the local
 2024 beta (0 mismatches after removing control codes).
 
+### What this pack does not claim
+
+- It does **not** embed a reverse-engineered glyph-code -> Unicode table for
+  the 2024 Chinese beta. That ROM's custom Chinese codepage is still not fully
+  decoded, and no OCR or model guess was used to fill it. The pack instead uses
+  the public Atlantis `zh-Hans` records, which are already keyed by the
+  verified Japanese text IDs. This is why the full-coverage claim is about the
+  Japanese target's message IDs, not about decoding the Chinese ROM's font.
+- Dynamic name/Psynergy/item controls are not resolved at runtime. The HUD
+  substitutes `某某` for a name insertion and generic `伙伴` / `技能` / `道具`
+  for the corresponding game variables; the game's own box still shows the
+  concrete value. The control-code sequence is validated, but the HUD does not
+  read the name buffer.
+- The Project Atlantis translations are AI drafts. A human-reviewed pass is a
+  separate quality task and is not claimed here.
+
 ## Building and verifying a pack
 
 ```sh
