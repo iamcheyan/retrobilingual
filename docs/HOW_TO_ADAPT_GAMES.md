@@ -37,9 +37,14 @@ Look near the `textIndex` address for a byte that changes when:
 
 ## Step 2: Implement the Game Adapter
 
-Create a new file in `core/adapters/<game_id>.c` implementing the `RBAdapter` interface:
+Create a new file in `core/adapters/<game_id>.c` implementing the `RBAdapter`
+interface. `rom_size` and `sha256_hex` are compared against the **unpadded
+file size**: mGBA's `GBA.memory.romSize` is rounded up to the cartridge mask,
+so the core hashes `GBA.pristineRomSize` when available. A pack whose SHA is
+built from the file will never load if the adapter gates on the padded size.
 
 ```c
+
 #include "adapter.h"
 #include <mgba/core/core.h>
 #include <mgba/internal/gba/gba.h>
@@ -55,14 +60,16 @@ static void emerald_reset(void) {
     sCurrentPage = 0;
 }
 
-static int emerald_read(struct mCore* core, uint16_t* out_text_id, uint8_t* out_page) {
+static int emerald_read(struct mCore* core, uint16_t keys,
+                        uint16_t* out_text_id, uint8_t* out_page) {
     if (!core) return 0;
     const struct GBA* gba = (const struct GBA*)core->board;
-    if (!gba || !gba->memory.ewram) return 0;
+    if (!gba || !gba->memory.wram) return 0;
 
-    /* Read text ID from discovered RAM offset */
-    uint32_t ram_addr = 0x02020000; /* Replace with discovered address */
-    uint16_t textId = *(const uint16_t*)(gba->memory.ewram + (ram_addr - 0x02000000));
+    /* Read text ID from discovered RAM offset. keys uses the internal
+     * libretro keymap: bit 0 = A, bit 1 = B, ... */
+    uint8_t* ewram = (uint8_t*)gba->memory.wram;
+    uint16_t textId = (uint16_t)(ewram[0x20000] | (ewram[0x20001] << 8));
 
     if (textId == 0 || textId == 0xFFFF) return 0;
 
@@ -84,6 +91,7 @@ const RBAdapter g_rb_adapter_pokemon_emerald = {
     .sha256_hex = POKEMON_EMERALD_SHA256,
     .reset = emerald_reset,
     .read_dialogue = emerald_read,
+    .page_slack = 0, /* set 1 if A can briefly overshoot the next page */
 };
 ```
 

@@ -60,7 +60,7 @@ class PackPageIdentityTests(unittest.TestCase):
             )
             db.execute(
                 "INSERT INTO translations VALUES (?, ?, ?, ?, ?, ?)",
-                ("zelda_minish_cap", source_hash, "0309", 0, "raw", "approved"),
+                ("golden_sun_jp", source_hash, "0309", 0, "raw", "approved"),
             )
             db.commit()
             db.close()
@@ -81,6 +81,7 @@ class PackPageIdentityTests(unittest.TestCase):
                 [
                     "python3", str(PACK),
                     "--database", str(database),
+                    "--game-id", "golden_sun_jp",
                     "--texts", str(texts),
                     "--source-rom-sha256", source_hash,
                     "--font", str(FONT),

@@ -13,14 +13,20 @@ typedef struct {
     const char* sha256_hex;
     /* Reset adapter internal state (e.g. on game reset or state load) */
     void (*reset)(void);
-    /* Returns 1 if active dialogue text is found, 0 otherwise */
-    int (*read_dialogue)(struct mCore* core, uint16_t* out_text_id, uint8_t* out_page);
+    /* Returns 1 if active dialogue text is found, 0 otherwise.
+     * keys is the current RetroPad key bitmask; adapters that track pages may
+     * consume it. */
+    int (*read_dialogue)(struct mCore* core, uint16_t keys,
+                         uint16_t* out_text_id, uint8_t* out_page);
+    /* Page indices advance on A presses for this game, so a stale index may
+     * overshoot the built pages while the next message is loading. */
+    uint8_t page_slack;
 } RBAdapter;
 
 /* Built-in game adapters */
 extern const RBAdapter g_rb_adapter_tmc;
-
-/* Registry lookup by ROM size & SHA-256 */
+extern const RBAdapter g_rb_adapter_golden_sun;
+extern const RBAdapter g_rb_adapter_golden_sun_cn2024;
 const RBAdapter* rb_adapter_match(uint32_t rom_size, const uint8_t sha256[32]);
 
 #endif /* RB_ADAPTER_H */

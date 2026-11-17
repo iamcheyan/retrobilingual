@@ -31,7 +31,7 @@ By listening directly to the emulator's memory bus (e.g. GBA EWRAM), the core de
 - **5-Slot Instant Save State Management (5 槽位即时存档与状态感知)**:
   Built-in quick save/load system decoupled from default emulator slots. Features live filesystem detection (populated slots highlighted in green, empty in gray) and smooth on-screen Toast alerts.
 - **Modular Game Adapter Architecture (模块化多游戏适配器架构)**:
-  While shipped with *The Legend of Zelda: The Minish Cap* as the reference implementation, the core engine is **100% game-agnostic**. Any retro game can be supported simply by adding a small RAM adapter.
+  Ships with *The Legend of Zelda: The Minish Cap* and *Golden Sun: The Opened Seal* (AGSJ01) adapters. The core engine is **100% game-agnostic**; any retro game can be supported by adding a small RAM adapter.
 - **Embedded Font Atlas Compiler (超紧凑字模打包器)**:
   Python CLI tool `pack.py` automatically extracts and bakes only the glyphs used in your translation into a 12px 1bpp atlas, reducing memory consumption to negligible levels.
 
@@ -61,6 +61,7 @@ retrobilingual/
 │   └── adapters/           # Modular game RAM reflection adapters
 │       ├── adapter.h       # Generic adapter interface
 │       ├── tmc.c           # Reference: Zelda Minish Cap adapter
+│       ├── golden_sun.c    # Golden Sun AGSJ01 adapter (JP + 2024 beta gate)
 │       └── template.c      # Boilerplate template for new games
 ├── patches/                # Integration hooks
 │   └── apply-mgba.py       # One-step patch script for mGBA
@@ -69,6 +70,7 @@ retrobilingual/
 ├── docs/                   # In-depth technical guides
 │   ├── ARCHITECTURE.md     # Architectural deep dive
 │   ├── HOW_TO_ADAPT_GAMES.md # Complete tutorial: adapting any new game
+│   ├── GOLDEN_SUN.md       # Golden Sun version gate, page model, coverage
 │   └── HARDWARE_MAPPING.md # Embedded Linux button mapping & DTS debugging
 └── tests/                  # Standalone test suite
     ├── test_host.py        # Host Python test runner

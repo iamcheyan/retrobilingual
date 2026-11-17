@@ -66,6 +66,7 @@ def main() -> int:
                 "gcc", "-std=c11", "-O1", "-Wall", "-DRB_HOST_TEST",
                 "-I", str(ROOT / "tests/host"), "-I", str(ROOT / "core"),
                 str(ROOT / "core/retrobilingual.c"),
+                str(ROOT / "tests/host/test_adapter.c"),
                 str(ROOT / "tests/host/test_overlay.c"),
                 "-o", str(binary),
             ],
@@ -78,7 +79,69 @@ def main() -> int:
         if result.returncode != 0:
             print("host overlay test failed")
             return result.returncode
+
+        golden_sun = run_golden_sun(tmp, pack)
+        if golden_sun:
+            return golden_sun
         return 0
+
+
+GOLDEN_SUN_ROM = (
+    Path.home() / "development/PJOS-LINUX/resouces/GBA模拟器[PC端用]"
+    / "黄金太阳1-开启的封印（2024 new CN）.gba"
+)
+
+
+def run_golden_sun(tmp: Path, pack) -> int:
+    if not GOLDEN_SUN_ROM.exists():
+        print("skip: Golden Sun ROM not available")
+        return 0
+    rom = GOLDEN_SUN_ROM.read_bytes()
+    digest = hashlib.sha256(rom).hexdigest()
+    selected = [
+        ("0FDD", 0, "测试文本第一行\n测试文本第二行"),
+        ("0B37", 0, "翻页测试第一页第一行\n翻页测试第一页第二行"),
+        ("0B37", 1, "翻页测试第二页"),
+        ("0B38", 0, "重置测试文本第一行\n重置测试文本第二行"),
+    ]
+    chars = {c for _, _, text in selected for c in text if c != "\n"}
+    atlas, index = pack.build_atlas(chars, FONT, 12)
+    blob = pack.build_pack(selected, atlas, index, 12, bytes.fromhex(digest))
+    golden_dir = tmp / "golden-sun"
+    golden_dir.mkdir()
+    (golden_dir / "retrobilingual.pack").write_bytes(blob)
+
+    binary = tmp / "golden-sun-test"
+    subprocess.run(
+        [
+            "gcc", "-std=c11", "-O1", "-Wall", "-DRB_HOST_TEST",
+            "-I", str(ROOT / "tests/host"), "-I", str(ROOT / "core"),
+            str(ROOT / "core/retrobilingual.c"),
+            str(ROOT / "core/adapters/golden_sun.c"),
+            str(ROOT / "core/adapters/tmc.c"),
+            str(ROOT / "core/adapters/registry.c"),
+            str(ROOT / "tests/host/test_golden_sun.c"),
+            "-o", str(binary),
+        ],
+        check=True,
+    )
+    env = dict(os.environ, RETROBILINGUAL_DIR=str(golden_dir))
+    result = subprocess.run([str(binary), str(GOLDEN_SUN_ROM)], env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(result.stdout.strip())
+    if result.returncode != 0:
+        print("golden sun host test failed")
+        return result.returncode
+
+    wrong = bytearray(blob)
+    wrong[18] ^= 0xFF
+    (golden_dir / "retrobilingual.pack").write_bytes(wrong)
+    result = subprocess.run([str(binary), str(GOLDEN_SUN_ROM), "bad-gate"], env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    print(result.stdout.strip())
+    if result.returncode != 0:
+        print("golden sun ROM gate test failed")
+    return result.returncode
 
 
 if __name__ == "__main__":

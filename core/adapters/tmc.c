@@ -1,4 +1,4 @@
-#include "adapter.h"
+#include "adapters/adapter.h"
 #include <mgba/core/core.h>
 #include <mgba/internal/gba/gba.h>
 #include <string.h>
@@ -17,10 +17,11 @@ static void tmc_reset(void) {
     sTmcRender = 0;
 }
 
-static int tmc_read(struct mCore* core, uint16_t* out_text_id, uint8_t* out_page) {
+static int tmc_read(struct mCore* core, uint16_t keys, uint16_t* out_text_id, uint8_t* out_page) {
+    (void)keys;
     if (!core) return 0;
     const struct GBA* gba = (const struct GBA*)core->board;
-    if (!gba || !gba->memory.ewram) return 0;
+    if (!gba || !gba->memory.wram) return 0;
 
     /*
      * EWRAM layout for TMC dialogue engine:
@@ -29,9 +30,11 @@ static int tmc_read(struct mCore* core, uint16_t* out_text_id, uint8_t* out_page
      *             3 = WAIT (typewriter text finished, waiting for player A button)
      *             4 = ROLL/NEXT (player pressed A to flip to next page)
      */
-    uint32_t msg_base = 0x02001404;
-    uint16_t textId = *(const uint16_t*)(gba->memory.ewram + (msg_base - 0x02000000));
-    uint8_t render = *(const uint8_t*)(gba->memory.ewram + (0x02001489 - 0x02000000));
+    const uint8_t* wram = (const uint8_t*)gba->memory.wram;
+    uint16_t textId = *(const uint16_t*)(wram + 0x1404);
+    uint8_t state = wram[0x50];
+    if (!(state & 0x7F)) return 0;
+    uint8_t render = wram[0x1489];
 
     if (textId == 0 || textId == 0xFFFF) {
         return 0;
@@ -57,4 +60,5 @@ const RBAdapter g_rb_adapter_tmc = {
     .sha256_hex = TMC_JP_SHA256,
     .reset = tmc_reset,
     .read_dialogue = tmc_read,
+    .page_slack = 0,
 };
