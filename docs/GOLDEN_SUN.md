@@ -108,7 +108,8 @@ python3 tools/golden_sun_verify.py \
 ```
 
 The pack contains only the ROM SHA-256, a 1bpp glyph atlas, and glyph index
-sequences. It is 604,388 bytes for the current data set.
+sequences. The current JP pack is 604,388 bytes with SHA-256
+`097ac0389bd135ceb61f691558e5bbf10a7924c34e4935e7a6bc4281a82a28a1`.
 
 ## ROM-size gate
 
