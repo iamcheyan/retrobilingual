@@ -9,16 +9,19 @@ git-ignored work directory.
 
 | Profile | Region / version | Size | SHA-256 | Runtime role |
 | --- | --- | ---: | --- | --- |
-| `golden_sun_jp` | Japan, AGSJ01 rev0 (`Ougon no Taiyou - Hirakareshi Fuuin`) | 8,388,608 (`0x00800000`) | `088bedae4bad8b67e87ff10035a898d3639f3182d486fe5a5d113bab223e0a26` | Production target |
+| `golden_sun_jp` | Clean Japan, AGSJ01 rev0 (`Ougon no Taiyou - Hirakareshi Fuuin`) | 8,388,608 (`0x00800000`) | `088bedae4bad8b67e87ff10035a898d3639f3182d486fe5a5d113bab223e0a26` | Production target |
+| `golden_sun_rg34xx_f4` | RG34XX AGSJ-labelled patched dump; in-game dialogue is Chinese | 9,256,960 (`0x008D4000`) | `f4e431616b920ecb572349f06dcdefd34c15789d2032216e27fe9f7ee36703b5` | Device verification profile; same message IDs |
 | `golden_sun_cn2024` | 2024 public Chinese beta, AGSJ01 base | 11,594,160 (`0x00B0E9B0`) | `f566de927b4ccf95e55686553db3089c26b842158d49a2a91472a8b6ba1419bc` | Local verification only |
 
-The four `.gba` files available in the local resource directory were checked
-by header, size, SHA-256, and runtime screenshots. All four are Chinese
-translations (CGP classic, CGP & ElfFinal, 2024 public beta, and a renamed
-2024/CGP duplicate); none is the clean Japanese AGSJ01 rev0 image. In
-particular `golden-sun-gba-2001.gba` is not Japanese despite its AGSJ header.
-The clean JP hash above is the version documented by the public Project
-Atlantis localization workspace.
+The four `.gba` files in the local resource directory were checked by header,
+size, SHA-256, and runtime screenshots. All four contain Chinese translations;
+none is the clean Japanese AGSJ01 rev0 image. The file called
+`golden-sun-gba-2001.gba` and the handheld's
+`Ougon no Taiyou - Hirakareshi Fuuin (Japan).gba` both have hash `f4e431…03b5`
+and render Chinese dialogue. They receive a separate exact-hash profile so
+the handheld can be tested without claiming that this patched dump is the
+clean Japanese ROM. The clean JP hash above comes from the public Project
+Atlantis localization workspace and remains the production pack target.
 
 ## Runtime model
 
@@ -144,33 +147,45 @@ python3 tests/test-retrobilingual-pack.py    # PJOS tree
 sh tools/build-retrobilingual-mgba-h700.sh   # PJOS AArch64 core
 ```
 
-The host harness covers the exact JP and 2024 beta ROM gates, EWRAM message
-ID reads, multi-page A-press sync, typewriter fast-forward rejection, message
-change resets, closed-box reset, unknown IDs, and a mismatched pack gate. The
-real-ROM verification profile loads the 2024 beta and renders its current
-message through the full pack; it is a verification aid, not the production
-target.
+The host harness covers clean JP, RG34XX patched, and 2024 beta ROM gates,
+EWRAM message ID reads, multi-page A-press sync, typewriter fast-forward
+rejection, message change resets, closed-box reset, unknown IDs, and a
+mismatched pack gate. The real-ROM harness loads the 2024 beta and the
+RG34XX-labelled patched dump with their respective complete packs.
 
 ## Deployment
 
 The device install path is `/storage/.config/pocketjs/retrobilingual.pack`.
-Use the PJOS helper with the pack built for the **clean JP** ROM:
+The clean JP pack remains gated to the clean AGSJ01 ROM. For device-side
+verification, build the approved mappings against the exact RG34XX patched
+dump hash and deploy that profile:
 
 ```sh
 PJOS_ADB_SERIAL=<serial> sh tools/deploy-retrobilingual.sh \
-  --pack work/golden-sun/retrobilingual-golden-sun-jp.pack
+  --pack work/golden-sun/retrobilingual-golden-sun-rg34xx-jp.pack
 ```
 
-The helper backs up the existing core and driver, pushes the pack atomically,
-and verifies the core hash. It does not start or stop a game.
+On 2026-11-18 the RG34XX core and pack were deployed and hash-checked:
+
+- Core SHA-256: `f754314fde91cbf58087b15602fa93910253bbaab444416c0b338528d254172d`
+- Pack SHA-256: `f531f4a973f79f5b390e3c73d660390f7bd0b41b3479064adea6496296707604`
+- Device ROM SHA-256: `f4e431616b920ecb572349f06dcdefd34c15789d2032216e27fe9f7ee36703b5`
+- Pre-deployment backup: `/storage/pjs/retrobilingual-backup-golden-sun-20261118`
+
+An isolated copy of the device ROM was launched through `pocket-game-play`.
+The HUD displayed the matching translated line; after X-close, A-advance, and
+X-open, it displayed the next translated line. Captures are in PJOS-LINUX
+`work/golden-sun/rg34xx-hud-final-core.png` and
+`work/golden-sun/rg34xx-hud-after-a-final-core.png`. X was injected as
+BTN_NORTH / evdev 307 through a temporary uinput pad at js index 3, matching
+the configured X mapping. The physical key was not pressed.
 
 ## Open external dependencies
 
-1. The clean Japanese AGSJ01 rev0 ROM (size/hash above) is not present on this
-   machine. The adapter's JP gate and pack are built for it, but its runtime
-   EWRAM cursor and page behavior cannot be exercised until that exact dump is
-   supplied.
-2. No authorized ADB/SSH session to the RG34XX was available during this work
-   (`adb devices` empty; the reachable LAN SSH endpoint rejected the available
-   credentials). Device deployment and framebuffer verification are therefore
-   not claimed.
+1. The clean Japanese AGSJ01 rev0 ROM (size/hash above) is still unavailable on
+   the device. The installed RG34XX profile targets a Japanese-ID-compatible
+   patched dump whose in-game dialogue is Chinese; it proves the device HUD
+   path and message updates, not visual behavior on the clean Japanese ROM.
+2. This run injected the X-mapped event through uinput. A physical X button
+   press on the clean Japanese ROM remains unverified.
+3. The Project Atlantis translations are AI drafts, not human-reviewed.
