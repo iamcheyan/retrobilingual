@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "host_stubs.h"
 
@@ -19,6 +20,9 @@ int rb_test_hud_pos(void);
 int rb_test_hud_scroll(void);
 int rb_test_hud_first_visible_line(void);
 int rb_test_visual_filter(void);
+int rb_test_autosave_interval(void);
+void rb_test_autosave_start_at(int64_t now_ms);
+void rb_test_autosave_tick_at(struct mCore* core, int64_t now_ms);
 const char* rb_test_toast(void);
 int rb_test_slot_info(int slot, char* area_out, size_t area_sz, int* hearts_out, int* rupees_out);
 
@@ -403,6 +407,35 @@ int main(int argc, char** argv) {
     assert(rb_test_visual_filter() == (initial_filter + 1) % RB_FILTER_COUNT);
     assert(strlen(rb_test_toast()) > 0);
 
+    /* AUTO SAVE is the sixth menu item and persists its interval. */
+    keys = (1u << 7); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    keys = (1u << 4); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_autosave_interval() == 1); /* 1 minute */
+    const char* autosave_dir = getenv("RETROBILINGUAL_DIR");
+    assert(autosave_dir != NULL);
+    char config_path[512];
+    snprintf(config_path, sizeof(config_path), "%s/retrobilingual.conf", autosave_dir);
+    FILE* config = fopen(config_path, "r");
+    assert(config != NULL);
+    char config_text[1024] = {0};
+    size_t config_size = fread(config_text, 1, sizeof(config_text) - 1, config);
+    fclose(config);
+    assert(config_size > 0 && strstr(config_text, "autosave_interval=1") != NULL);
+    char autosave_path[512];
+    snprintf(autosave_path, sizeof(autosave_path), "%s/retrobilingual-autosave.state", autosave_dir);
+    unlink(autosave_path);
+    rb_test_autosave_start_at(0);
+    rb_test_autosave_tick_at(&core, 0);
+    rb_test_autosave_tick_at(&core, 59999);
+    assert(access(autosave_path, F_OK) != 0);
+    rb_test_autosave_tick_at(&core, 60000);
+    assert(access(autosave_path, R_OK) == 0);
+    assert(strstr(rb_test_toast(), "AUTO SAVED") != NULL);
+    /* Disable again; the selected manual slot remains available. */
+    keys = (1u << 5); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_autosave_interval() == 0);
+    assert(rb_test_slot_has_data(1) == 1);
+
     /* Test retrobilingual_present 720x480 output */
     void* out_buf = NULL;
     unsigned out_w = 0, out_h = 0, out_pitch = 0;
@@ -416,6 +449,6 @@ int main(int argc, char** argv) {
     y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
     assert(rb_test_state() == RB_STATE_GAME);
 
-    puts("host overlay test: pack gate, page tracking, chord pause, subtitle, 5 slots, position cycling, save/load toasts, visual filter OK");
+    puts("host overlay test: pack gate, page tracking, chord pause, subtitle, 5 slots, position cycling, save/load, autosave timing, visual filter OK");
     return 0;
 }

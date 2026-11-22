@@ -29,7 +29,7 @@ By listening directly to the emulator's memory bus (e.g. GBA EWRAM), the core de
 - **Adaptive Multi-Line Floating HUD (智能无感双行浮层)**:
   Minimalist translucent backing with high-contrast 1bpp bitmap font. Supports 1-line and 2-line standard GBA dialogue boxes, with configurable vertical placement (`AUTO`, `TOP`, `CENTER`, `BOTTOM`).
 - **5-Slot Instant Save State Management (5 槽位即时存档与状态感知)**:
-  Built-in quick save/load system decoupled from default emulator slots. Features live filesystem detection (populated slots highlighted in green, empty in gray) and smooth on-screen Toast alerts.
+  Built-in quick save/load system decoupled from default emulator slots. Features live filesystem detection (populated slots highlighted in green, empty in gray) and smooth on-screen Toast alerts. The Y quick menu also supports timed autosaves every 1, 3, 5, 10, 15, or 30 minutes; autosaves are disabled by default and use a separate state file.
 - **Modular Game Adapter Architecture (模块化多游戏适配器架构)**:
   Ships with *The Legend of Zelda: The Minish Cap* and *Golden Sun: The Opened Seal* (AGSJ01) adapters. The core engine is **100% game-agnostic**; any retro game can be supported by adding a small RAM adapter.
 - **Embedded Font Atlas Compiler (超紧凑字模打包器)**:
@@ -41,11 +41,11 @@ By listening directly to the emulator's memory bus (e.g. GBA EWRAM), the core de
 
 | Key | Action | Description |
 |---|---|---|
-| **Y (Left button)** | **Quick Menu (快捷菜单)** | Opens in-game overlay menu (Resume, Quick Save, Quick Load, X Action, Position). Pauses game logic. |
+| **Y (Left button)** | **Quick Menu (快捷菜单)** | Opens in-game overlay menu (Quick Save, Quick Load, X Action, Position, Filter, Auto Save). Pauses game logic. |
 | **X (Top button)** | **Instant Translate (一键翻译)** | Immediately pops up floating translation HUD for current line. Tap X or B to dismiss. |
 | **B (Bottom button)**| **Back / Resume (返回/恢复)** | Closes open menu or subtitle HUD and unfreezes the game. |
 | **D-Pad Up/Down** | **Navigate Menu** | Cycles menu items. |
-| **D-Pad Left/Right**| **Cycle Slot / Position** | Switches save slot (1..5) or HUD position (`AUTO` / `TOP` / `CENTER` / `BOTTOM`). |
+| **D-Pad Left/Right**| **Cycle Menu Option** | Switches save slot, HUD position, filter, or autosave interval (`OFF` / `1` / `3` / `5` / `10` / `15` / `30` minutes). |
 
 ---
 
