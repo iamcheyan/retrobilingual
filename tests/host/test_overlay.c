@@ -22,7 +22,7 @@ int rb_test_visual_filter(void);
 const char* rb_test_toast(void);
 int rb_test_slot_info(int slot, char* area_out, size_t area_sz, int* hearts_out, int* rupees_out);
 
-enum { RB_STATE_GAME = 0, RB_STATE_MENU = 1, RB_STATE_SUBTITLE = 2 };
+enum { RB_STATE_GAME = 0, RB_STATE_MENU = 1, RB_STATE_SUBTITLE = 2, RB_STATE_BINDINGS = 3, RB_STATE_CONFIRM_OVERWRITE = 4 };
 
 static int x_down;
 static int y_down;
@@ -296,6 +296,24 @@ int main(int argc, char** argv) {
     assert(strstr(rb_test_toast(), "SAVED TO SLOT 2") != NULL);
     assert(rb_test_slot_has_data(1) == 1); /* Slot 2 now has data! */
     assert(rb_test_slot_has_data(2) == 0); /* Slot 3 still empty */
+
+    /* Slot 2 now has data. Trying to save again should prompt for overwrite confirmation! */
+    y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    keys = (1u << 0); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_CONFIRM_OVERWRITE); /* Confirmation prompt active! */
+    /* Press B to cancel */
+    keys = (1u << 1); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_GAME);
+    assert(strstr(rb_test_toast(), "SAVE CANCELLED") != NULL);
+
+    /* Open menu again, trigger save, and confirm with A */
+    y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    keys = (1u << 0); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_CONFIRM_OVERWRITE);
+    /* Press A to confirm overwrite */
+    keys = (1u << 0); retrobilingual_process_input(&core, &keys, input_cb); keys = 0; retrobilingual_process_input(&core, &keys, input_cb);
+    assert(rb_test_state() == RB_STATE_GAME);
+    assert(strstr(rb_test_toast(), "SAVED TO SLOT 2") != NULL);
 
     /* Open menu again, move to QUICK LOAD (item 1) and load Slot 2 */
     y_down = 1; retrobilingual_process_input(&core, &keys, input_cb); y_down = 0; retrobilingual_process_input(&core, &keys, input_cb);
